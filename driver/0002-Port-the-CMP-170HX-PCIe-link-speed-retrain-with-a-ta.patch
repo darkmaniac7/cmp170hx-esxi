@@ -1,0 +1,488 @@
+From 0e836aa40357f2359581a33a318f05013a82df50 Mon Sep 17 00:00:00 2001
+From: darkmaniac7 <darkmaniac7@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:55:16 -0500
+Subject: [PATCH 2/4] Port the CMP 170HX PCIe link-speed retrain with a
+ target-generation parameter
+
+Port the cmpunlocker _cmpRetrainGen2 reference into the 580.178.04 CMP
+backport. The retrain runs inside the existing CMP unlock block of
+_kgspBootGspRm(), after the memory/SS postcondition check and before the
+stock signature is rebuilt, the point the reference uses, so the host-side
+XP writes land while the PLM gates are open.
+
+- Open the PCIe subset of the reference PLM table through the SEC2 Booter
+  (XVE, XVE_B, XVE_C, XVE_PLM, XVE_CYA_PLM, XVE_FUSE_OVR, XVE_CYA_SPD,
+  XVE_TARGET), one Booter Load per entry, non-fatal, WPR2 restored each round.
+- Host-side XP programming: clear the XP_CYA0 Gen1 pins, set the XP_CFG0 max
+  rate field (the reference value 2, or 3 for Gen4), select the target speed
+  in XP_LCTRL2 [19:16], write the upstream port LnkCtl2 target speed when the
+  port is known (logged, never required), trigger the directed speed change
+  through XP_CFG0 bit 0 and poll the LTSSM busy bit 4.
+- New module parameter NVreg_CmpPcieTargetGen (regkey CmpPcieTargetGen):
+  0 = no retrain, 1..4 = PCIe generation to request, default 2; values
+  above 4 disable the retrain and are logged.
+- Read-back logging as "CMP580: pcie retrain" lines: LnkCap (BAR0 mirror
+  and config space), LnkCtlSta speed/width, LnkCtl2, the XP registers,
+  every gate round, the root-port write and the final link state.
+- Re-check the memory/SS postcondition after the extra Booter rounds and
+  abort the boot if it no longer holds.
+- No behaviour change for non-CMP devices (PCI IDs 0x20C2/0x2082 only)
+  or when the parameter is 0.
+---
+ kernel-open/nvidia/nv-reg.h                   |  22 ++
+ src/nvidia/arch/nvalloc/unix/include/nv-reg.h |  22 ++
+ src/nvidia/interface/nvrm_registry.h          |  13 +
+ src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c    | 308 ++++++++++++++++++
+ 4 files changed, 365 insertions(+)
+
+diff --git a/kernel-open/nvidia/nv-reg.h b/kernel-open/nvidia/nv-reg.h
+index 0ccf14c..592619b 100644
+--- a/kernel-open/nvidia/nv-reg.h
++++ b/kernel-open/nvidia/nv-reg.h
+@@ -766,6 +766,26 @@
+ #define __NV_ENABLE_GPU_FIRMWARE_LOGS  EnableGpuFirmwareLogs
+ #define NV_REG_ENABLE_GPU_FIRMWARE_LOGS NV_REG_STRING(__NV_ENABLE_GPU_FIRMWARE_LOGS)
+ 
++/*
++ * Option: CmpPcieTargetGen
++ *
++ * CMP 170HX (PCI device 0x20C2 / 0x2082) only; no effect on any other GPU.
++ * The CMP VBIOS leaves the PCIe link pinned at Gen1. During the CMP unlock
++ * (the SEC2 Booter window) the driver can open the XVE/XP gates and ask the
++ * link to retrain at a higher generation. Read-backs are logged as
++ * "CMP580: pcie retrain" lines.
++ *
++ * Possible values:
++ *  0    - never touch the link (the accepted 580.178.04 CMP behaviour).
++ *  1..4 - PCIe generation to request. Gen2 (5 GT/s) is what the reference
++ *         unlock proves; Gen3 and Gen4 are attempts.
++ *  Any other value disables the retrain and is logged.
++ *  Default: 2.
++ */
++#define __NV_CMP_PCIE_TARGET_GEN CmpPcieTargetGen
++#define NV_REG_CMP_PCIE_TARGET_GEN NV_REG_STRING(__NV_CMP_PCIE_TARGET_GEN)
++#define NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT 2
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -999,6 +1019,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_IMEX_CHANNEL_COUNT, 2048);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_CREATE_IMEX_CHANNEL_0, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1048,6 +1069,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_IMEX_CHANNEL_COUNT),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CREATE_IMEX_CHANNEL_0),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+index 0ccf14c..592619b 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
++++ b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+@@ -766,6 +766,26 @@
+ #define __NV_ENABLE_GPU_FIRMWARE_LOGS  EnableGpuFirmwareLogs
+ #define NV_REG_ENABLE_GPU_FIRMWARE_LOGS NV_REG_STRING(__NV_ENABLE_GPU_FIRMWARE_LOGS)
+ 
++/*
++ * Option: CmpPcieTargetGen
++ *
++ * CMP 170HX (PCI device 0x20C2 / 0x2082) only; no effect on any other GPU.
++ * The CMP VBIOS leaves the PCIe link pinned at Gen1. During the CMP unlock
++ * (the SEC2 Booter window) the driver can open the XVE/XP gates and ask the
++ * link to retrain at a higher generation. Read-backs are logged as
++ * "CMP580: pcie retrain" lines.
++ *
++ * Possible values:
++ *  0    - never touch the link (the accepted 580.178.04 CMP behaviour).
++ *  1..4 - PCIe generation to request. Gen2 (5 GT/s) is what the reference
++ *         unlock proves; Gen3 and Gen4 are attempts.
++ *  Any other value disables the retrain and is logged.
++ *  Default: 2.
++ */
++#define __NV_CMP_PCIE_TARGET_GEN CmpPcieTargetGen
++#define NV_REG_CMP_PCIE_TARGET_GEN NV_REG_STRING(__NV_CMP_PCIE_TARGET_GEN)
++#define NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT 2
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -999,6 +1019,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_IMEX_CHANNEL_COUNT, 2048);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_CREATE_IMEX_CHANNEL_0, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1048,6 +1069,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_IMEX_CHANNEL_COUNT),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CREATE_IMEX_CHANNEL_0),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/interface/nvrm_registry.h b/src/nvidia/interface/nvrm_registry.h
+index ea00512..a321dde 100644
+--- a/src/nvidia/interface/nvrm_registry.h
++++ b/src/nvidia/interface/nvrm_registry.h
+@@ -2641,6 +2641,19 @@
+ #define NV_REG_STR_RM_GSP_SCAN_WPR_END_MARGIN_ENABLE      0x00000001
+ #define NV_REG_STR_RM_GSP_SCAN_WPR_END_MARGIN_DISABLE     0x00000000
+ 
++//
++// Type DWORD
++// CMP 170HX only (PCI device 0x20C2 / 0x2082): PCIe generation the CMP580
++// unlock asks the link to retrain at while the XVE/XP PLM gates are open.
++// 0 disables the retrain (the link stays where the VBIOS left it, Gen1);
++// 1..4 request that PCIe generation. Exposed as NVreg_CmpPcieTargetGen.
++// Values above the maximum disable the retrain and are logged.
++//
++#define NV_REG_STR_CMP_PCIE_TARGET_GEN                    "CmpPcieTargetGen"
++#define NV_REG_STR_CMP_PCIE_TARGET_GEN_DEFAULT            2
++#define NV_REG_STR_CMP_PCIE_TARGET_GEN_DISABLED           0
++#define NV_REG_STR_CMP_PCIE_TARGET_GEN_MAX                4
++
+ //
+ // Type DWORD
+ // Regkey to set the number of retry attempts at GSP bootstrap
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+index 23a72c5..d9673dd 100644
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -95,6 +95,10 @@
+ #include "diagnostics/code_coverage_mgr.h"
+ #endif
+ 
++/* CMP580 PCIe retrain: root-port config access and the chipset object. */
++#include "core/system.h"
++#include "platform/chipset/chipset.h"
++
+ #define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID   0x20C2
+ #define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID 0x2082
+ #define SEC2_POSTBL_TIMING_SIGNATURE_SIZE          0x0000f800ULL
+@@ -175,6 +179,305 @@ _kgspSec2PostblTimingCheckRegisters(OBJGPU *pGpu)
+     return NV_OK;
+ }
+ 
++/* -------------------------------------------------------------------------
++ * CMP580: PCIe link-speed retrain (port of the cmpunlocker _cmpRetrainGen2
++ * reference).
++ *
++ * The CMP 170HX VBIOS leaves the PCIe link pinned at Gen1 behind PLM-gated
++ * XVE/XP registers. The SEC2 Booter rounds below open the PCIe gates the same
++ * way the core gates are opened in _kgspBootGspRm(); the host-side XP writes
++ * only stick inside that window, so the retrain is called from the CMP unlock
++ * block after the memory/SS writes are verified and before the stock signature
++ * is rebuilt, the point the reference uses. NVreg_CmpPcieTargetGen selects the
++ * generation: 0 = never touch the link, 1..4 = PCIe generation to request.
++ * Only PCI device IDs 0x20C2 / 0x2082 reach this code.
++ * ------------------------------------------------------------------------- */
++#define CMP580_PCIE_XP_CFG0                 0x0008c040U /* LTSSM directive [3:0], LTSSM busy [4], max rate [19:18] */
++#define CMP580_PCIE_XP_LCTRL2               0x0008c1c0U /* target link speed [19:16] */
++#define CMP580_PCIE_XP_CYA0                 0x0008c2c0U /* Gen1 pins: CMP580_PCIE_XP_CYA0_GEN1_PINS */
++#define CMP580_PCIE_XVE_LINK_CAP            0x00088084U /* PCIe capability LnkCap, BAR0 mirror (cap base 0x78) */
++#define CMP580_PCIE_XVE_LINK_CTRL_STAT      0x00088088U /* PCIe capability LnkCtl/LnkSta, BAR0 mirror */
++#define CMP580_PCIE_XVE_LINK_CTRL2          0x000880a8U /* PCIe capability LnkCtl2, BAR0 mirror */
++#define CMP580_PCIE_CFG_LINK_CAP            0x84U       /* same registers through PCI config space */
++#define CMP580_PCIE_CFG_LINK_CTRL_STAT      0x88U
++#define CMP580_PCIE_CFG_LINK_CTRL2          0xa8U
++#define CMP580_PCIE_XP_CYA0_GEN1_PINS       0x00802005U
++#define CMP580_PCIE_XP_CFG0_MAX_RATE_MASK   0x000C0000U
++#define CMP580_PCIE_XP_CFG0_MAX_RATE_SHIFT  18
++#define CMP580_PCIE_XP_CFG0_MAX_RATE_REF    0x2U        /* what the reference writes for Gen2 */
++#define CMP580_PCIE_XP_CFG0_MAX_RATE_TOP    0x3U        /* only encoding above the reference; used for Gen4 */
++#define CMP580_PCIE_XP_CFG0_DIRECTIVE_MASK  0x0000000FU
++#define CMP580_PCIE_XP_CFG0_CHANGE_SPEED    0x00000001U
++#define CMP580_PCIE_XP_CFG0_LTSSM_BUSY      0x00000010U
++#define CMP580_PCIE_XP_LCTRL2_TARGET_MASK   0x000F0000U
++#define CMP580_PCIE_XP_LCTRL2_TARGET_SHIFT  16
++#define CMP580_PCIE_LNKCAP_MAX_SPEED(v)     ((v) & 0xFU)
++#define CMP580_PCIE_LNKCAP_MAX_WIDTH(v)     (((v) >> 4) & 0x3FU)
++#define CMP580_PCIE_LNKSTA_SPEED(v)         (((v) >> 16) & 0xFU)
++#define CMP580_PCIE_LNKSTA_WIDTH(v)         (((v) >> 20) & 0x3FU)
++#define CMP580_PCIE_LNKCTL2_TARGET(v)       ((v) & 0xFU)
++#define CMP580_PCIE_LNKCTL2_TARGET_MASK     0x000FU
++#define CMP580_PCIE_ROOT_LNKCTL2_OFFSET     0x30U       /* LnkCtl2 offset inside the PCIe capability */
++#define CMP580_PCIE_RETRAIN_POLLS           50U
++#define CMP580_PCIE_RETRAIN_POLL_MS         10U
++
++typedef struct
++{
++    NvU32       addr;
++    NvU32       value;
++    NvU32       mask;
++    const char *name;
++} CMP580_PCIE_GATE;
++
++/*
++ * PCIe subset of the reference PLM table, written through the SEC2 Booter
++ * (one Booter Load per entry). XVE_TARGET takes the requested generation.
++ */
++static const CMP580_PCIE_GATE cmp580PcieGates[] = {
++    { 0x00088ff4U, 0xffffffffU, 0xffffffffU, "XVE"          },
++    { 0x00088ab4U, 0xffffffffU, 0xffffffffU, "XVE_B"        },
++    { 0x00088ff8U, 0xffffffffU, 0xffffffffU, "XVE_C"        },
++    { 0x00088fe8U, 0xffffffffU, 0xffffffffU, "XVE_PLM"      },
++    { 0x00088fecU, 0xffffffffU, 0xffffffffU, "XVE_CYA_PLM"  },
++    { 0x0008872cU, 0x0000000aU, 0x0000000fU, "XVE_FUSE_OVR" },
++    { 0x0008841cU, 0x4034ad00U, 0x4000a800U, "XVE_CYA_SPD"  },
++    { CMP580_PCIE_XVE_LINK_CTRL2, 0x00000000U, 0x0000000fU, "XVE_TARGET" },
++};
++
++static NvU32
++_kgspCmp580PcieTargetGen(OBJGPU *pGpu)
++{
++    NvU32 gen = NV_REG_STR_CMP_PCIE_TARGET_GEN_DEFAULT;
++
++    if (osReadRegistryDword(pGpu, NV_REG_STR_CMP_PCIE_TARGET_GEN, &gen) != NV_OK)
++        gen = NV_REG_STR_CMP_PCIE_TARGET_GEN_DEFAULT;
++
++    if (gen > NV_REG_STR_CMP_PCIE_TARGET_GEN_MAX)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: pcie retrain disabled: NVreg_CmpPcieTargetGen=%u is outside 0..%u\n",
++                  gen, NV_REG_STR_CMP_PCIE_TARGET_GEN_MAX);
++        gen = NV_REG_STR_CMP_PCIE_TARGET_GEN_DISABLED;
++    }
++
++    return gen;
++}
++
++static void
++_kgspCmp580PcieLogLink(OBJGPU *pGpu, const char *tag)
++{
++    NvU32 lnkCap  = GPU_REG_RD32(pGpu, CMP580_PCIE_XVE_LINK_CAP);
++    NvU32 lnkSta  = GPU_REG_RD32(pGpu, CMP580_PCIE_XVE_LINK_CTRL_STAT);
++    NvU32 lnkCtl2 = GPU_REG_RD32(pGpu, CMP580_PCIE_XVE_LINK_CTRL2);
++    NvU32 cfgCap = 0, cfgSta = 0, cfgCtl2 = 0;
++
++    if (GPU_BUS_CFG_RD32(pGpu, CMP580_PCIE_CFG_LINK_CAP, &cfgCap) != NV_OK)
++        cfgCap = 0xffffffffU;
++    if (GPU_BUS_CFG_RD32(pGpu, CMP580_PCIE_CFG_LINK_CTRL_STAT, &cfgSta) != NV_OK)
++        cfgSta = 0xffffffffU;
++    if (GPU_BUS_CFG_RD32(pGpu, CMP580_PCIE_CFG_LINK_CTRL2, &cfgCtl2) != NV_OK)
++        cfgCtl2 = 0xffffffffU;
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: pcie retrain %s: LnkCap=0x%08x (cfg 0x%08x) maxspeed=%u maxwidth=x%u "
++              "LnkCtlSta=0x%08x (cfg 0x%08x) speed=%u width=x%u "
++              "LnkCtl2=0x%08x (cfg 0x%08x) target=%u "
++              "XP_CFG0=0x%08x XP_LCTRL2=0x%08x XP_CYA0=0x%08x\n",
++              tag,
++              lnkCap, cfgCap,
++              CMP580_PCIE_LNKCAP_MAX_SPEED(lnkCap), CMP580_PCIE_LNKCAP_MAX_WIDTH(lnkCap),
++              lnkSta, cfgSta,
++              CMP580_PCIE_LNKSTA_SPEED(lnkSta), CMP580_PCIE_LNKSTA_WIDTH(lnkSta),
++              lnkCtl2, cfgCtl2, CMP580_PCIE_LNKCTL2_TARGET(lnkCtl2),
++              GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0),
++              GPU_REG_RD32(pGpu, CMP580_PCIE_XP_LCTRL2),
++              GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CYA0));
++}
++
++/*
++ * Runs inside the CMP unlock window of _kgspBootGspRm(): the core gates are
++ * open, the memory/SS registers are written and verified, the Booter payload
++ * is still in the signature buffer and the stock signature is not yet back.
++ */
++static NV_STATUS
++_kgspCmp580PcieRetrain(OBJGPU *pGpu, KernelGsp *pKernelGsp, NvU32 wpr2Lo, NvU32 wpr2Hi)
++{
++    NvU32 gen = _kgspCmp580PcieTargetGen(pGpu);
++    NvU32 idx, attempt, polls;
++    NvU32 xpCfg0, xpLctrl2, xpCya0, maxRate, cfg0Now, cfg0After, linkCtrlStat;
++    NvBool bBusy = NV_TRUE;
++
++    if (gen == NV_REG_STR_CMP_PCIE_TARGET_GEN_DISABLED)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: pcie retrain disabled (NVreg_CmpPcieTargetGen=0); link left as is\n");
++        return NV_OK;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: pcie retrain requested gen=%u (NVreg_CmpPcieTargetGen)\n", gen);
++    _kgspCmp580PcieLogLink(pGpu, "pre");
++
++    /* Open the PCIe gates through the Booter, one Booter Load per entry. */
++    for (idx = 0; idx < NV_ARRAY_ELEMENTS(cmp580PcieGates); idx++)
++    {
++        const CMP580_PCIE_GATE *pGate = &cmp580PcieGates[idx];
++        NvU32 want = pGate->value;
++        NvBool opened = NV_FALSE;
++
++        if (pGate->addr == CMP580_PCIE_XVE_LINK_CTRL2)
++            want = gen;
++
++        for (attempt = 0; attempt < 2 && !opened; attempt++)
++        {
++            NV_STATUS gateStatus;
++            NvU32 regVal;
++
++            /* Booter Load clobbers the WPR2 window; put it back each round. */
++            GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++            GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++
++            gateStatus = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
++                                                           pGate->addr, want);
++            if (gateStatus != NV_OK)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "CMP580: pcie retrain gate[%u] %s payload refill failed: 0x%x\n",
++                          idx, pGate->name, gateStatus);
++                continue;
++            }
++
++            gateStatus = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
++                memdescGetPhysAddr(SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp), AT_GPU, 0));
++
++            regVal = GPU_REG_RD32(pGpu, pGate->addr);
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMP580: pcie retrain gate[%u] %s(0x%x) want=0x%08x mask=0x%08x "
++                      "attempt=%u status=0x%x reg=0x%08x\n",
++                      idx, pGate->name, pGate->addr, want, pGate->mask,
++                      attempt, gateStatus, regVal);
++
++            if ((regVal & pGate->mask) == (want & pGate->mask))
++                opened = NV_TRUE;
++        }
++
++        if (!opened)
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMP580: pcie retrain gate %s did not take after 2 attempts; continuing\n",
++                      pGate->name);
++    }
++
++    GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++    GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++
++    /*
++     * Host-side XP programming, the reference sequence with the generation
++     * taken from the parameter: drop the CYA pins, set the XP max rate
++     * (the reference's value for Gen1..Gen3, the top encoding for Gen4), and
++     * select the target speed.
++     */
++    xpCfg0   = GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0);
++    xpLctrl2 = GPU_REG_RD32(pGpu, CMP580_PCIE_XP_LCTRL2);
++    xpCya0   = GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CYA0);
++    maxRate  = (gen >= 4U) ? CMP580_PCIE_XP_CFG0_MAX_RATE_TOP : CMP580_PCIE_XP_CFG0_MAX_RATE_REF;
++
++    GPU_REG_WR32(pGpu, CMP580_PCIE_XP_CYA0, xpCya0 & ~CMP580_PCIE_XP_CYA0_GEN1_PINS);
++    GPU_REG_WR32(pGpu, CMP580_PCIE_XP_CFG0,
++                 (xpCfg0 & ~CMP580_PCIE_XP_CFG0_MAX_RATE_MASK) |
++                 (maxRate << CMP580_PCIE_XP_CFG0_MAX_RATE_SHIFT));
++    GPU_REG_WR32(pGpu, CMP580_PCIE_XP_LCTRL2,
++                 (xpLctrl2 & ~CMP580_PCIE_XP_LCTRL2_TARGET_MASK) |
++                 (gen << CMP580_PCIE_XP_LCTRL2_TARGET_SHIFT));
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: pcie retrain xp writes: XP_CYA0 0x%08x->0x%08x "
++              "XP_CFG0 0x%08x->0x%08x (max_rate=%u) XP_LCTRL2 0x%08x->0x%08x (target=%u)\n",
++              xpCya0, GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CYA0),
++              xpCfg0, GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0), maxRate,
++              xpLctrl2, GPU_REG_RD32(pGpu, CMP580_PCIE_XP_LCTRL2), gen);
++
++    /*
++     * Both ends have to agree on the target speed, so set it on the upstream
++     * port too. In a VM that port is the hypervisor's virtual bridge and the
++     * write changes nothing physically; log it and retrain regardless.
++     */
++    {
++        OBJCL *pCl = SYS_GET_CL(SYS_GET_INSTANCE());
++        PORTDATA *pUpPort = &pGpu->gpuClData.upstreamPort;
++
++        if (pCl != NULL && pUpPort->addr.valid && pUpPort->PCIECapPtr != 0)
++        {
++            NvU32 lnkCtl2Off = pUpPort->PCIECapPtr + CMP580_PCIE_ROOT_LNKCTL2_OFFSET;
++            NvU16 rpLnkCtl2 = clPcieReadWord(pCl,
++                pUpPort->addr.domain, pUpPort->addr.bus,
++                pUpPort->addr.device, pUpPort->addr.func, lnkCtl2Off);
++            NvU16 rpLnkCtl2New =
++                (NvU16)((rpLnkCtl2 & ~CMP580_PCIE_LNKCTL2_TARGET_MASK) | gen);
++            NvU16 rpLnkCtl2Rd;
++
++            clPcieWriteWord(pCl,
++                pUpPort->addr.domain, pUpPort->addr.bus,
++                pUpPort->addr.device, pUpPort->addr.func,
++                lnkCtl2Off, rpLnkCtl2New);
++            rpLnkCtl2Rd = clPcieReadWord(pCl,
++                pUpPort->addr.domain, pUpPort->addr.bus,
++                pUpPort->addr.device, pUpPort->addr.func, lnkCtl2Off);
++
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMP580: pcie retrain root port %04x:%02x:%02x.%u LnkCtl2@0x%x: "
++                      "0x%04x -> 0x%04x readback 0x%04x%s\n",
++                      pUpPort->addr.domain, (NvU32)pUpPort->addr.bus,
++                      (NvU32)pUpPort->addr.device, (NvU32)pUpPort->addr.func,
++                      lnkCtl2Off, (NvU32)rpLnkCtl2, (NvU32)rpLnkCtl2New, (NvU32)rpLnkCtl2Rd,
++                      (rpLnkCtl2Rd == rpLnkCtl2New) ? "" : " (did not take)");
++        }
++        else
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMP580: pcie retrain root port unavailable (cl=%u valid=%u capptr=0x%x); "
++                      "GPU-side retrain proceeds\n",
++                      (NvU32)(pCl != NULL), (NvU32)pUpPort->addr.valid, pUpPort->PCIECapPtr);
++        }
++    }
++
++    /* Directed speed change, then wait for the LTSSM to settle. */
++    cfg0Now = GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0);
++    GPU_REG_WR32(pGpu, CMP580_PCIE_XP_CFG0,
++                 (cfg0Now & ~CMP580_PCIE_XP_CFG0_DIRECTIVE_MASK) | CMP580_PCIE_XP_CFG0_CHANGE_SPEED);
++
++    for (polls = 0; polls < CMP580_PCIE_RETRAIN_POLLS; polls++)
++    {
++        osDelay(CMP580_PCIE_RETRAIN_POLL_MS);
++        if ((GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0) & CMP580_PCIE_XP_CFG0_LTSSM_BUSY) == 0)
++        {
++            bBusy = NV_FALSE;
++            break;
++        }
++    }
++
++    cfg0After = GPU_REG_RD32(pGpu, CMP580_PCIE_XP_CFG0);
++    GPU_REG_WR32(pGpu, CMP580_PCIE_XP_CFG0, cfg0After & ~CMP580_PCIE_XP_CFG0_DIRECTIVE_MASK);
++
++    linkCtrlStat = GPU_REG_RD32(pGpu, CMP580_PCIE_XVE_LINK_CTRL_STAT);
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: pcie retrain done gen=%u polls=%u%s XP_CFG0=0x%08x "
++              "LinkCtrlStat=0x%08x speed=%u width=x%u\n",
++              gen, polls, bBusy ? " (LTSSM still busy)" : "", cfg0After, linkCtrlStat,
++              CMP580_PCIE_LNKSTA_SPEED(linkCtrlStat), CMP580_PCIE_LNKSTA_WIDTH(linkCtrlStat));
++    _kgspCmp580PcieLogLink(pGpu, "post");
++
++    /* The extra Booter rounds must not have disturbed the memory/SS unlock. */
++    if (_kgspSec2PostblTimingCheckRegisters(pGpu) != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: pcie retrain: memory/SS postcondition no longer holds; "
++                  "aborting boot (set NVreg_CmpPcieTargetGen=0 to bypass)\n");
++        return NV_ERR_INVALID_STATE;
++    }
++
++    return NV_OK;
++}
++
+ static NV_STATUS
+ _kgspSec2PostblTimingValidateFbRegions
+ (
+@@ -4153,6 +4456,11 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+         }
+ 
+         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspSec2PostblTimingCheckRegisters(pGpu));
++
++        /* CMP580: PCIe link-speed retrain while the gates are still open. */
++        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
++            _kgspCmp580PcieRetrain(pGpu, pKernelGsp, wpr2Lo, wpr2Hi));
++
+         plmStatus = kgspSec2PostblTimingRebuildStockSignature(pGpu, pKernelGsp);
+         if (plmStatus != NV_OK)
+         {

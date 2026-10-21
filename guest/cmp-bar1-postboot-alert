@@ -1,0 +1,24 @@
+#!/bin/bash
+# Post-boot check: every CMP 170HX must show a 64 GiB BAR1 (guest resource1) and the repair hook must have run.
+# Raises an alert through notify() when the four-card writer silently fell back on the host.
+set -u
+LOG=/var/lib/cmp-bar1-repair/postboot-alert.log
+# notify MESSAGE: alert stub. Writes to stderr and $LOG; replace the body with your own channel (mail, webhook, pager).
+notify() { echo "ALERT: $1" >&2; echo "$(date -Is) ALERT: $1" >> "$LOG"; }
+bad=(); seen=0
+for d in /sys/bus/pci/devices/0000:*; do
+  [ "$(cat $d/vendor 2>/dev/null)" = 0x10de ] || continue
+  dev=$(cat $d/device 2>/dev/null); [ "$dev" = 0x20c2 ] || [ "$dev" = 0x2082 ] || continue
+  seen=$((seen+1)); size=$(stat -c %s $d/resource1 2>/dev/null || echo 0)
+  [ "$size" = 68719476736 ] || bad+=("$(basename $d):$((size>>20))MiB")
+done
+hook=$(journalctl -b -t cmp-bar1-repair --no-pager 2>/dev/null | grep -c "repair summary")
+refused=$(journalctl -b -t cmp-bar1-repair --no-pager 2>/dev/null | grep -c "REFUSE")
+nvml_small=$(timeout 30 nvidia-smi -q 2>/dev/null | grep -A1 "BAR1 Memory Usage" | grep -c "Total *: *\(64\|256\) MiB")
+line="$(date -Is) boot=$(cat /proc/sys/kernel/random/boot_id) cmps=$seen bad=${#bad[@]} hook_runs=$hook refused=$refused nvml_small_bar1=$nvml_small ${bad[*]:-}"
+echo "$line" >> $LOG; logger -t cmp-bar1-postboot-alert "$line"
+if [ $seen -ne 4 ] || [ ${#bad[@]} -gt 0 ] || [ "$hook" = 0 ] || [ "$refused" != 0 ] || [ "$nvml_small" != 0 ]; then
+  msg="CMP BAR1 post-boot check FAILED: cmps=$seen bad=[${bad[*]:-}] hook_runs=$hook refused=$refused nvml_small_bar1=$nvml_small. The four-card EFI writer may have fallen back or the host booted without it. VRAM/Gen2 still serve; BAR1 is small until the writer re-runs (two_card_window.py --profile four-card)."
+  notify "$msg"
+fi
+exit 0

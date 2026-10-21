@@ -1,0 +1,316 @@
+From 37350a252d8d9dfa405e8a7558135b8472efecbd Mon Sep 17 00:00:00 2001
+From: darkmaniac7 <darkmaniac7@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:24:30 -0500
+Subject: [PATCH 3/4] Add the CMP 170HX ECC hardware-recipe experiment behind
+ NVreg_CmpEccRecipe
+
+Ports only the hardware half of cmpunlocker v0.5 ecc-enable.patch (14 SEC2
+post-Booter register writes plus upstream WPR/VPR/lock teardown) into the
+unlock window after the PCIe retrain, gated by a new DWORD registry key
+CmpEccRecipe (default 0, per-device capable). Every write and read-back and
+the before/after readouts are logged as CMP580: ecc recipe lines. No ECC
+reporting path is changed; RM re-reads the hardware readout afterwards.
+---
+ kernel-open/nvidia/nv-reg.h                   |  18 ++
+ src/nvidia/arch/nvalloc/unix/include/nv-reg.h |  18 ++
+ src/nvidia/interface/nvrm_registry.h          |  15 ++
+ src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c    | 167 ++++++++++++++++++
+ 4 files changed, 218 insertions(+)
+
+diff --git a/kernel-open/nvidia/nv-reg.h b/kernel-open/nvidia/nv-reg.h
+index 592619b..a7a1da6 100644
+--- a/kernel-open/nvidia/nv-reg.h
++++ b/kernel-open/nvidia/nv-reg.h
+@@ -786,6 +786,22 @@
+ #define NV_REG_CMP_PCIE_TARGET_GEN NV_REG_STRING(__NV_CMP_PCIE_TARGET_GEN)
+ #define NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT 2
+ 
++/*
++ * Option: CmpEccRecipe
++ *
++ * Description:
++ *
++ * CMP 170HX only. 1 applies the experimental cmpunlocker ECC hardware recipe
++ * (14 register writes through the SEC2 post-Booter payload) during the
++ * unlock window and logs every write and read-back; 0 does nothing. Nothing
++ * about ECC reporting is changed by this option.
++ *
++ * Default: 0.
++ */
++#define __NV_CMP_ECC_RECIPE CmpEccRecipe
++#define NV_REG_CMP_ECC_RECIPE NV_REG_STRING(__NV_CMP_ECC_RECIPE)
++#define NV_REG_CMP_ECC_RECIPE_DEFAULT 0
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -1020,6 +1036,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_CREATE_IMEX_CHANNEL_0, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_ECC_RECIPE, NV_REG_CMP_ECC_RECIPE_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1070,6 +1087,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CREATE_IMEX_CHANNEL_0),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_ECC_RECIPE),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+index 592619b..a7a1da6 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
++++ b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+@@ -786,6 +786,22 @@
+ #define NV_REG_CMP_PCIE_TARGET_GEN NV_REG_STRING(__NV_CMP_PCIE_TARGET_GEN)
+ #define NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT 2
+ 
++/*
++ * Option: CmpEccRecipe
++ *
++ * Description:
++ *
++ * CMP 170HX only. 1 applies the experimental cmpunlocker ECC hardware recipe
++ * (14 register writes through the SEC2 post-Booter payload) during the
++ * unlock window and logs every write and read-back; 0 does nothing. Nothing
++ * about ECC reporting is changed by this option.
++ *
++ * Default: 0.
++ */
++#define __NV_CMP_ECC_RECIPE CmpEccRecipe
++#define NV_REG_CMP_ECC_RECIPE NV_REG_STRING(__NV_CMP_ECC_RECIPE)
++#define NV_REG_CMP_ECC_RECIPE_DEFAULT 0
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -1020,6 +1036,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_CREATE_IMEX_CHANNEL_0, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_ECC_RECIPE, NV_REG_CMP_ECC_RECIPE_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1070,6 +1087,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CREATE_IMEX_CHANNEL_0),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_ECC_RECIPE),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/interface/nvrm_registry.h b/src/nvidia/interface/nvrm_registry.h
+index a321dde..07809a8 100644
+--- a/src/nvidia/interface/nvrm_registry.h
++++ b/src/nvidia/interface/nvrm_registry.h
+@@ -2654,6 +2654,21 @@
+ #define NV_REG_STR_CMP_PCIE_TARGET_GEN_DISABLED           0
+ #define NV_REG_STR_CMP_PCIE_TARGET_GEN_MAX                4
+ 
++//
++// Type DWORD
++// CMP 170HX only (PCI device 0x20C2 / 0x2082): opt-in ECC hardware
++// recipe experiment. 0 (default) does nothing. 1 applies the 14 cmpunlocker
++// v0.5 ecc-enable register writes through the SEC2 post-Booter payload while
++// the unlock window is open and logs every write and read-back as
++// "CMP580: ecc recipe". No ECC reporting is overridden: RM and NVML keep
++// reporting whatever the hardware says. Exposed as NVreg_CmpEccRecipe,
++// usable per device through NVreg_RegistryDwordsPerDevice.
++//
++#define NV_REG_STR_CMP_ECC_RECIPE                         "CmpEccRecipe"
++#define NV_REG_STR_CMP_ECC_RECIPE_DEFAULT                 0
++#define NV_REG_STR_CMP_ECC_RECIPE_DISABLED                0
++#define NV_REG_STR_CMP_ECC_RECIPE_APPLY                   1
++
+ //
+ // Type DWORD
+ // Regkey to set the number of retry attempts at GSP bootstrap
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+index d9673dd..c40072f 100644
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -4320,6 +4320,159 @@ _kgspBootReacquireLocks(OBJGPU *pGpu, KernelGsp *pKernelGsp, GPU_MASK *pGpusLock
+     return NV_OK;
+ }
+ 
++/*
++ * CMP580: opt-in ECC hardware recipe experiment (cmpunlocker v0.5
++ * ecc-enable.patch, hardware half only). Runs inside the unlock window right
++ * after the PCIe retrain, one Booter Load per register, exactly the upstream
++ * sequence: WPR2 blanket before every payload, the 14 writes, then upstream's
++ * WPR/VPR/lock teardown. Every write is logged with its read-back. Nothing in
++ * ECC reporting is touched; RM, NVML and nvidia-smi keep reporting whatever
++ * the hardware returns afterwards.
++ */
++#define CMP580_ECC_READ_INVALID(v) \
++    ((v) == 0xffffffffU || ((v) & 0xfff00000U) == 0xbad00000U)
++
++typedef struct
++{
++    NvU32 addr;
++    NvU32 value;
++    NvBool bOr;
++    const char *name;
++} CMP580_ECC_WRITE;
++
++static const CMP580_ECC_WRITE cmp580EccRecipe[] = {
++    { 0x001fa7ccU, 0xffffffffU, NV_FALSE, "WPR_CFG_PLM"      },
++    { 0x001fa7c8U, 0xffffffffU, NV_FALSE, "WPR_PLM_B"        },
++    { 0x001fa7c0U, 0xffffffffU, NV_FALSE, "WPR_PLM_A"        },
++    { 0x001fa7d0U, 0xffffffffU, NV_FALSE, "WPR_PLM_C"        },
++    { 0x00823800U, 0xffffffffU, NV_FALSE, "FEAT_OVR_ECC_PLM" },
++    { 0x0082380cU, 0x00999999U, NV_FALSE, "FEAT_OVR_ECC"     },
++    { 0x00823810U, 0x003ffebfU, NV_FALSE, "FEAT_OVR_ECC_1"   },
++    { 0x0082382cU, 0x0000000fU, NV_FALSE, "FEAT_OVR_ECC_2"   },
++    { 0x009a0470U, 0x00000041U, NV_TRUE,  "FBPA_ECC_CTRL"    },
++    { 0x009a1004U, 0x00000200U, NV_TRUE,  "FBPA_MRS_ECC"     },
++    { 0x009a033cU, 0x00000003U, NV_TRUE,  "FBPA_ECC_B"       },
++    { 0x009a0084U, 0x00000001U, NV_TRUE,  "FBPA_ECC_C"       },
++    { 0x0017e318U, 0x00000001U, NV_TRUE,  "LTC_ECC_A"        },
++    { 0x0017e21cU, 0x00000001U, NV_TRUE,  "LTC_ECC_B"        },
++};
++
++static const NvU32 cmp580EccReadouts[] = {
++    0x00823814U, 0x0082380cU, 0x00823810U, 0x0082382cU, 0x00823800U,
++    0x009a0470U, 0x009a1004U, 0x009a033cU, 0x009a0084U, 0x0017e318U, 0x0017e21cU,
++    0x001fa81cU, 0x001fa820U, 0x001fa824U, 0x001fa828U, 0x001fa804U, 0x001fa808U,
++    0x001fa82cU, 0x001fa830U, 0x001fa80cU,
++};
++
++static NvU32
++_kgspCmp580EccRecipeRequested(OBJGPU *pGpu)
++{
++    NvU32 mode = NV_REG_STR_CMP_ECC_RECIPE_DEFAULT;
++
++    if (osReadRegistryDword(pGpu, NV_REG_STR_CMP_ECC_RECIPE, &mode) != NV_OK)
++        mode = NV_REG_STR_CMP_ECC_RECIPE_DEFAULT;
++    if (mode > NV_REG_STR_CMP_ECC_RECIPE_APPLY)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: ecc recipe disabled: NVreg_CmpEccRecipe=%u is outside 0..1\n", mode);
++        mode = NV_REG_STR_CMP_ECC_RECIPE_DISABLED;
++    }
++    return mode;
++}
++
++static void
++_kgspCmp580EccLogReadouts(OBJGPU *pGpu, const char *tag)
++{
++    NvU32 i;
++
++    for (i = 0; i < NV_ARRAY_ELEMENTS(cmp580EccReadouts); i++)
++    {
++        NvU32 v = GPU_REG_RD32(pGpu, cmp580EccReadouts[i]);
++        NV_PRINTF(LEVEL_ERROR, "CMP580: ecc recipe %s readout 0x%08x = 0x%08x%s\n",
++                  tag, cmp580EccReadouts[i], v,
++                  (cmp580EccReadouts[i] == 0x00823814U) ?
++                      (((v >> 16) & 1U) ? " (ECC_DRAM bit16=1)" : " (ECC_DRAM bit16=0)") : "");
++    }
++}
++
++static NV_STATUS
++_kgspCmp580EccRecipe(OBJGPU *pGpu, KernelGsp *pKernelGsp, NvU32 wpr2Lo, NvU32 wpr2Hi)
++{
++    NvU32 mode = _kgspCmp580EccRecipeRequested(pGpu);
++    NvU32 idx, taken = 0, mismatched = 0, invalid = 0;
++
++    if (mode != NV_REG_STR_CMP_ECC_RECIPE_APPLY)
++    {
++        NV_PRINTF(LEVEL_ERROR, "CMP580: ecc recipe not requested (NVreg_CmpEccRecipe=%u)\n", mode);
++        return NV_OK;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: ecc recipe requested (NVreg_CmpEccRecipe=1); saved WPR2 lo=0x%08x hi=0x%08x\n",
++              wpr2Lo, wpr2Hi);
++    _kgspCmp580EccLogReadouts(pGpu, "pre");
++
++    for (idx = 0; idx < NV_ARRAY_ELEMENTS(cmp580EccRecipe); idx++)
++    {
++        const CMP580_ECC_WRITE *pW = &cmp580EccRecipe[idx];
++        NvU32 want = pW->value, before = 0, after;
++        NV_STATUS st;
++
++        /* Upstream blanks the WPR2 window before every payload. */
++        GPU_REG_WR32(pGpu, 0x001fa824U, 0xffffffffU);
++        GPU_REG_WR32(pGpu, 0x001fa828U, 0x00000000U);
++
++        if (pW->bOr)
++        {
++            before = GPU_REG_RD32(pGpu, pW->addr);
++            if (CMP580_ECC_READ_INVALID(before))
++            {
++                invalid++;
++                NV_PRINTF(LEVEL_ERROR,
++                          "CMP580: ecc recipe[%u] %s(0x%x) pre-read invalid 0x%08x; write skipped\n",
++                          idx, pW->name, pW->addr, before);
++                continue;
++            }
++            want |= before;
++        }
++
++        st = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp, pW->addr, want);
++        if (st != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR, "CMP580: ecc recipe[%u] %s payload refill failed: 0x%x\n",
++                      idx, pW->name, st);
++            continue;
++        }
++        st = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
++            memdescGetPhysAddr(SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp), AT_GPU, 0));
++        after = GPU_REG_RD32(pGpu, pW->addr);
++        if (after == want)
++            taken++;
++        else
++            mismatched++;
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: ecc recipe[%u] %s(0x%x) before=0x%08x want=0x%08x status=0x%x read=0x%08x%s\n",
++                  idx, pW->name, pW->addr, before, want, st, after,
++                  (after == want) ? " taken" : " MISMATCH");
++    }
++
++    /* Upstream's WPR/VPR/lock teardown, verbatim. */
++    GPU_REG_WR32(pGpu, 0x001fa81cU, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa820U, 0x00000000U);
++    GPU_REG_WR32(pGpu, 0x001fa824U, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa828U, 0x00000000U);
++    GPU_REG_WR32(pGpu, 0x001fa804U, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa808U, 0x00000000U);
++    GPU_REG_WR32(pGpu, 0x001fa82cU, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa830U, 0x00000000U);
++    GPU_REG_WR32(pGpu, 0x001fa80cU, GPU_REG_RD32(pGpu, 0x001fa80cU) & ~0x10U);
++
++    _kgspCmp580EccLogReadouts(pGpu, "post");
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: ecc recipe done: taken=%u mismatched=%u invalid=%u of %u; "
++              "FEATURE_READOUT=0x%08x FBPA_ECC_CTRL=0x%08x (MR4 not directly readable; FBPA_MRS_ECC proxy 0x%08x)\n",
++              taken, mismatched, invalid, (NvU32)NV_ARRAY_ELEMENTS(cmp580EccRecipe),
++              GPU_REG_RD32(pGpu, 0x00823814U), GPU_REG_RD32(pGpu, 0x009a0470U),
++              GPU_REG_RD32(pGpu, 0x009a1004U));
++    return NV_OK;
++}
++
+ static NV_STATUS
+ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MASK *pGpusLockedMask, NvU8 *pbRetry)
+ {
+@@ -4461,6 +4614,20 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+             _kgspCmp580PcieRetrain(pGpu, pKernelGsp, wpr2Lo, wpr2Hi));
+ 
++        /* CMP580: optional ECC hardware recipe experiment (NVreg_CmpEccRecipe). */
++        if (_kgspCmp580EccRecipeRequested(pGpu) == NV_REG_STR_CMP_ECC_RECIPE_APPLY)
++        {
++            NvBool bEccBefore = bEccDisabled;
++            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
++                _kgspCmp580EccRecipe(pGpu, pKernelGsp, wpr2Lo, wpr2Hi));
++            /* Memory postcondition must still hold after the recipe (fatal otherwise). */
++            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspSec2PostblTimingCheckRegisters(pGpu));
++            /* Re-read the hardware ECC readout; no override, just a fresh read. */
++            bEccDisabled = !kmemsysCheckReadoutEccEnablement(pGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu));
++            NV_PRINTF(LEVEL_ERROR, "CMP580: ecc recipe readout enablement before=%s after=%s\n",
++                      bEccBefore ? "disabled" : "enabled", bEccDisabled ? "disabled" : "enabled");
++        }
++
+         plmStatus = kgspSec2PostblTimingRebuildStockSignature(pGpu, pKernelGsp);
+         if (plmStatus != NV_OK)
+         {

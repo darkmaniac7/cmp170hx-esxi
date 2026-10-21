@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+writer/build/
+*.o
+*.so
+*.EFI
+*.efi
+*.img

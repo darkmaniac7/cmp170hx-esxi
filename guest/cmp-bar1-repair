@@ -1,0 +1,768 @@
+#!/usr/bin/python3 -I
+"""cmp-bar1-repair: restore the 64 GiB BAR1 vendor override on NVIDIA CMP 170HX
+cards (10de:20c2 / 10de:2082) before the nvidia kernel module loads.
+
+Background (lane cmp170hx-esxi-bar64-20261018): ESXi passthrough resets the
+GPU-internal ReBAR override at every VM power-on.  The host keeps the 64 GiB
+BAR1 allocation and the guest sees a 64 GiB resource1, but the GPU's config
+mirror page (BAR0 + 0x88000) is back at the reset profile and NVML then reports
+256 MiB BAR1 once the driver has loaded.  The proven repair (2026-10-18 17:47Z,
+guest 0000:0d:00.0) is exactly two 32-bit stores into that page while the
+nvidia driver is NOT bound:  0x724 = 0x30, then 0xdcc = 0x8000000a.  After a
+normal driver load NVML reports 65536 MiB and 60 GiB CUDA tests pass.
+
+Monitored words (page offsets, in order):
+  000 ID  004 CMD/STS  078 PCIe cap  080 DEVCTL/DEVSTA  010 BAR0  014 BAR1lo
+  018 BAR1hi  01c BAR3lo  020 BAR3hi  bb0 ReBAR hdr  bb8 ReBAR ctrl(BAR0)
+  bbc ReBAR CAP(BAR1)  bc0 ReBAR CTRL(BAR1)  724 CYA  dcc CFG
+Words 4..8 are the PHYSICAL (host) BAR address words of the card; they differ
+per card and from the guest sysfs addresses and are never compared with them.
+  reset profile    : CAP 0x400    CTRL 0x601 or 0x801  CYA 0x26  CFG 0x80000000
+                     (0x601 is the firmware-time value, 0x801 what ESXi's
+                     power-on reset left on the first repaired card; both
+                     mean 'device thinks small, host allocated 64 GiB')
+  restored profile : CAP 0x1ffc00 CTRL 0x1001 CYA 0x30  CFG 0x8000000a
+
+On a cold boot the kernel leaves a driverless function with memory decode off
+(COMMAND.MEM = 0) and every BAR0 read returns 0xffffffff.  A live run therefore
+enables decode through sysfs `enable` (pci_enable_device: MEM decode only,
+never bus master), re-reads COMMAND and requires MEM=1 BME=0 before reading
+the page.  It is left enabled (the driver enables it anyway).  --check and
+--dry-run never write `enable`; they report `decode off`.
+
+Every run holds one exclusive flock on /run/cmp-bar1-repair.lock for its whole
+duration (udev coldplug invokes the hook once per NVIDIA function, within the
+same second); a 60 s wait that expires is a REFUSE, never a race.
+
+Fail-safe rules: a card is written only if its host BAR1 (resource1) is exactly
+64 GiB, the driver is not bound and the nvidia module is not loaded (unless
+--allow-module-loaded), the page shows exactly the reset profile with
+the expected ID and structure words, PCI COMMAND (sysfs config and the mirror)
+has MEMORY on and BUS_MASTER off, and no error / transactions-pending status
+bits are set.  Everything else is logged and left alone.  Only offsets 0x724
+and 0xdcc are ever written, in that order, at most once each, never retried.
+COMMAND, ReBAR CTRL and BAR registers are never written.  Exit status is 0
+in every case except --check/--dry-run together with --strict.
+"""
+import argparse
+import datetime
+import errno
+import fcntl
+import json
+import mmap
+import os
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+import traceback
+
+TOOL = 'cmp-bar1-repair'
+VERSION = '1.1.1'
+
+VENDOR = 0x10de
+DEVICES = (0x20c2, 0x2082)
+PAGE_OFFSET = 0x88000
+PAGE_SIZE = 4096
+RES0_SIZE = 16 * 1024 * 1024
+RES1_SIZE = 64 * 1024 * 1024 * 1024
+
+OFFSETS = (0x000, 0x004, 0x078, 0x080, 0x010, 0x014, 0x018, 0x01c, 0x020,
+           0xbb0, 0xbb8, 0xbbc, 0xbc0, 0x724, 0xdcc)
+NAMES = ('ID', 'CMD_STS', 'PCIE_CAP', 'DEVCTL_STA', 'BAR0', 'BAR1_LO', 'BAR1_HI',
+         'BAR3_LO', 'BAR3_HI', 'REBAR_HDR', 'REBAR_CTRL0', 'REBAR_CAP1',
+         'REBAR_CTRL1', 'CYA', 'CFG')
+I_ID, I_CMD, I_PCIE, I_DEVSTA = 0, 1, 2, 3
+I_CAP, I_CTRL, I_CYA, I_CFG = 11, 12, 13, 14
+# Layout words that identify this silicon's config mirror; identical on every
+# CMP 170HX (ReBAR extended cap header at 0xbb0, BAR0 ReBAR control = 16 MiB).
+# Word 000 (device ID) is pinned per device.  Words 004 (COMMAND/STATUS), 078
+# (PCIe DEVCTL/DEVSTA: the driver programs payload/read-request/relaxed-
+# ordering/no-snoop bits, seen 0x0002c810 after a Gen2 retrain) and 010..020
+# (physical BAR words) are informational: logged, checked by the explicit
+# COMMAND / DEVSTA / BAR1-alignment rules below, required unchanged across the
+# two stores, but never pinned to a constant.
+STRUCTURE = {9: 0x00010015, 10: 0x00000460}
+I_BAR1_LO, I_BAR1_HI = 5, 6
+RESET_CAP, RESET_CTRL_VALUES, RESET_CYA, RESET_CFG = 0x400, (0x601, 0x801), 0x26, 0x80000000
+RESTORED_PROFILE = (0x1ffc00, 0x1001, 0x30, 0x8000000a)
+WRITES = ((0x724, 0x30), (0xdcc, 0x8000000a))
+CAP_AFTER_WRITE1 = (0x400, 0x1ffc00)
+CTRL_AFTER_WRITE1 = (0x601, 0x801, 0x1001)
+
+CMD_MEMORY = 0x2
+CMD_BUS_MASTER = 0x4
+DEVSTA_BUSY_MASK = 0x2f   # CorrErr NonFatalErr FatalErr UnsupReq TransPend
+
+JOURNAL_DIR = '/var/lib/cmp-bar1-repair'
+RUN_DIR = '/run/cmp-bar1-repair'
+LOCK_FILE = '/run/cmp-bar1-repair.lock'
+LOCK_TIMEOUT = 60.0
+SYSFS_DEVICES = '/sys/bus/pci/devices'
+SYSFS_MODULES = '/sys/module'
+BOOT_ID_FILE = '/proc/sys/kernel/random/boot_id'
+LOGGER = '/usr/bin/logger'
+
+_SYSLOG = True
+
+
+# ----------------------------------------------------------------- helpers
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def stamp(dt):
+    return dt.strftime('%Y%m%dT%H%M%S.%f') + 'Z'
+
+
+def hexw(words):
+    return ' '.join('%03x=%08x' % (o, w) for o, w in zip(OFFSETS, words))
+
+
+def fields(words):
+    return 'CAP=0x%x CTRL=0x%x CYA=0x%x CFG=0x%x' % tuple(words[I_CAP:I_CFG + 1])
+
+
+def bad_word(v):
+    return v == 0xffffffff or (v & 0xfff00000) == 0xbad00000
+
+
+def log(prio, msg):
+    """stdout plus the system journal (logger tag cmp-bar1-repair). Never raises."""
+    try:
+        sys.stdout.write(msg + '\n')
+        sys.stdout.flush()
+    except Exception:
+        pass
+    if not _SYSLOG:
+        return
+    try:
+        subprocess.run([LOGGER, '-t', TOOL, '-p', 'daemon.' + prio, '--', msg],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except Exception:
+        try:
+            import syslog
+            syslog.openlog(TOOL)
+            syslog.syslog({'err': syslog.LOG_ERR, 'warning': syslog.LOG_WARNING,
+                           'notice': syslog.LOG_NOTICE}.get(prio, syslog.LOG_INFO), msg)
+        except Exception:
+            pass
+
+
+def read_text(path):
+    with open(path, 'r') as f:
+        return f.read().strip()
+
+
+def read_hex(path):
+    return int(read_text(path), 16)
+
+
+def ancestry(max_depth=6):
+    """Who invoked us (modprobe, systemd-udevd, nvidia-modprobe, a shell ...)."""
+    chain = []
+    pid = os.getppid()
+    for _ in range(max_depth):
+        if pid <= 1:
+            break
+        try:
+            with open('/proc/%d/comm' % pid) as f:
+                comm = f.read().strip()
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                cmd = f.read(512).replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+            ppid = None
+            with open('/proc/%d/status' % pid) as f:
+                for line in f:
+                    if line.startswith('PPid:'):
+                        ppid = int(line.split()[1])
+                        break
+        except Exception:
+            break
+        chain.append(dict(pid=pid, comm=comm, cmdline=cmd[:200]))
+        if ppid is None:
+            break
+        pid = ppid
+    return chain
+
+
+# ----------------------------------------------------------------- MMIO page
+class MirrorPage:
+    """Exactly one 4 KiB page of resource0 (BAR0 + 0x88000).
+
+    Read-only unless writable=True.  Every access is one aligned 32-bit
+    load/store: struct's native 'I' format is memcpy(&x, p, 4) with a constant
+    size, which the compiler emits as a single 32-bit move.  ('<I' would read
+    byte by byte and must never be used on MMIO.)  write32 enforces the store
+    whitelist (offset, value, order, count <= 2) independently of the caller.
+    """
+
+    def __init__(self, resource0, writable=False):
+        flags = os.O_CLOEXEC | os.O_NOFOLLOW | (os.O_RDWR if writable else os.O_RDONLY)
+        self.fd = os.open(resource0, flags)
+        self.mm = None
+        try:
+            st = os.fstat(self.fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, 'resource0 is not a regular file')
+            if st.st_size != RES0_SIZE:
+                raise OSError(errno.EINVAL, 'resource0 size %d is not 16 MiB' % st.st_size)
+            prot = mmap.PROT_READ | (mmap.PROT_WRITE if writable else 0)
+            self.mm = mmap.mmap(self.fd, PAGE_SIZE, flags=mmap.MAP_SHARED, prot=prot,
+                                offset=PAGE_OFFSET)
+        except Exception:
+            os.close(self.fd)
+            raise
+        self.writable = writable
+        self.stores = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self.mm is not None:
+            self.mm.close()
+            self.mm = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read32(self, off):
+        return struct.unpack_from('I', self.mm, off)[0]
+
+    def snapshot(self):
+        return [self.read32(o) for o in OFFSETS]
+
+    def write32(self, off, value):
+        n = len(self.stores)
+        if not self.writable or n >= len(WRITES) or (off, value) != WRITES[n]:
+            raise RuntimeError('store 0x%x=0x%x refused by the whitelist (store #%d)' % (off, value, n + 1))
+        self.stores.append((off, value))
+        struct.pack_into('I', self.mm, off, value)
+
+
+# ----------------------------------------------------------------- config space
+def read_config(path):
+    """PCI COMMAND/STATUS and the PCIe DEVCTL/DEVSTA from the sysfs config file."""
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        raw = os.pread(fd, 256, 0)
+    finally:
+        os.close(fd)
+    if len(raw) < 64:
+        raise ValueError('short config read (%d bytes)' % len(raw))
+    vendor, device, command, status = struct.unpack_from('<HHHH', raw, 0)
+    cfg = dict(vendor=vendor, device=device, command=command, status=status,
+               pcie_cap=None, devctl=None, devsta=None)
+    if status & 0x0010:
+        ptr = raw[0x34] & 0xfc
+        seen = set()
+        while 0x40 <= ptr and ptr not in seen and ptr + 12 <= len(raw):
+            seen.add(ptr)
+            cap_id = raw[ptr]
+            nxt = raw[ptr + 1] & 0xfc
+            if cap_id == 0x10:
+                cfg['pcie_cap'] = ptr
+                cfg['devctl'], cfg['devsta'] = struct.unpack_from('<HH', raw, ptr + 8)
+                break
+            ptr = nxt
+    return cfg
+
+
+def read_enable_count(devpath):
+    try:
+        return read_text(os.path.join(devpath, 'enable'))
+    except OSError:
+        return None
+
+
+def enable_decode(devpath):
+    """pci_enable_device() through sysfs: turns on MEM (and IO) decode, never bus master."""
+    fd = os.open(os.path.join(devpath, 'enable'), os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        os.write(fd, b'1')
+    finally:
+        os.close(fd)
+
+
+def nvidia_module_state(modules_dir):
+    try:
+        return read_text(os.path.join(modules_dir, 'nvidia', 'initstate'))
+    except OSError:
+        return None
+
+
+def mirror_idle_reasons(words):
+    r = []
+    cmd = words[I_CMD] & 0xffff
+    if not cmd & CMD_MEMORY:
+        r.append('mirror COMMAND MEMORY off (0x%04x)' % cmd)
+    if cmd & CMD_BUS_MASTER:
+        r.append('mirror COMMAND BUS_MASTER on (0x%04x)' % cmd)
+    devsta = (words[I_DEVSTA] >> 16) & 0xffff
+    if devsta & DEVSTA_BUSY_MASK:
+        r.append('mirror DEVSTA error/transactions-pending bits (0x%04x)' % devsta)
+    return r
+
+
+def bar1_alignment_reasons(words):
+    """A real 64 GiB host BAR1 is a 64-bit prefetchable BAR on a 64 GiB-aligned base."""
+    lo, hi = words[I_BAR1_LO], words[I_BAR1_HI]
+    r = []
+    if lo & 0xf != 0xc:
+        r.append('physical BAR1 low word 014=%08x is not a 64-bit prefetchable BAR' % lo)
+    if (lo & 0xfffffff0) or (hi & 0xf):
+        r.append('physical BAR1 base 0x%x is not 64 GiB-aligned' % ((hi << 32) | (lo & 0xfffffff0)))
+    return r
+
+
+def idle_reasons(cfg, words):
+    r = []
+    if not cfg['command'] & CMD_MEMORY:
+        r.append('config COMMAND MEMORY off (0x%04x)' % cfg['command'])
+    if cfg['command'] & CMD_BUS_MASTER:
+        r.append('config COMMAND BUS_MASTER on (0x%04x)' % cfg['command'])
+    if cfg['devsta'] is None:
+        r.append('config PCIe capability not found')
+    elif cfg['devsta'] & DEVSTA_BUSY_MASK:
+        r.append('config DEVSTA error/transactions-pending bits (0x%04x)' % cfg['devsta'])
+    return r + mirror_idle_reasons(words)
+
+
+def is_reset_profile(f):
+    cap, ctrl, cya, cfg = f
+    return cap == RESET_CAP and ctrl in RESET_CTRL_VALUES and cya == RESET_CYA and cfg == RESET_CFG
+
+
+def classify(words, device):
+    if any(bad_word(w) for w in words):
+        return 'BAD', 'unreadable word(s): ' + ' '.join('%03x=%08x' % (o, w) for o, w in zip(OFFSETS, words) if bad_word(w))
+    expected_id = (device << 16) | VENDOR
+    if words[I_ID] != expected_id:
+        return 'UNEXPECTED', 'word 000=%08x is not %08x' % (words[I_ID], expected_id)
+    for i, v in STRUCTURE.items():
+        if words[i] != v:
+            return 'UNEXPECTED', 'structure word %03x=%08x is not %08x' % (OFFSETS[i], words[i], v)
+    f = tuple(words[I_CAP:I_CFG + 1])
+    if f == RESTORED_PROFILE:
+        return 'RESTORED', fields(words)
+    if is_reset_profile(f):
+        return 'RESET', fields(words)
+    return 'UNEXPECTED', 'neither reset nor restored: ' + fields(words)
+
+
+def check_after_write1(before, after):
+    p = []
+    if after[I_CYA] != WRITES[0][1]:
+        p.append('CYA=0x%x not 0x30' % after[I_CYA])
+    if after[I_CAP] not in CAP_AFTER_WRITE1:
+        p.append('CAP=0x%x not in {0x400,0x1ffc00}' % after[I_CAP])
+    if after[I_CTRL] not in CTRL_AFTER_WRITE1:
+        p.append('CTRL=0x%x not in {0x601,0x801,0x1001}' % after[I_CTRL])
+    for i in range(len(OFFSETS)):
+        if i in (I_CAP, I_CTRL, I_CYA):
+            continue
+        if after[i] != before[i]:
+            p.append('%s %03x changed %08x->%08x' % (NAMES[i], OFFSETS[i], before[i], after[i]))
+    return p + mirror_idle_reasons(after)
+
+
+def check_after_write2(before, after):
+    p = []
+    if tuple(after[I_CAP:I_CFG + 1]) != RESTORED_PROFILE:
+        p.append('final %s is not the restored profile' % fields(after))
+    for i in range(I_CAP):
+        if after[i] != before[i]:
+            p.append('%s %03x changed %08x->%08x' % (NAMES[i], OFFSETS[i], before[i], after[i]))
+    return p + mirror_idle_reasons(after)
+
+
+# ----------------------------------------------------------------- journal / lock
+class Journal:
+    def __init__(self, primary_dir, fallback_dir, boot_id, started):
+        self.dirs = [primary_dir, fallback_dir]
+        self.name = '%s-%s.json' % (stamp(started), boot_id)
+        self.path = None
+        self.error = None
+
+    def persist(self, data):
+        """Atomic, fsynced write of the whole run record. Returns the path or None."""
+        payload = json.dumps(data, indent=1, sort_keys=True).encode() + b'\n'
+        dirs = [os.path.dirname(self.path)] if self.path else self.dirs
+        for d in dirs:
+            try:
+                os.makedirs(d, mode=0o700, exist_ok=True)
+                target = os.path.join(d, self.name)
+                tmp = target + '.tmp'
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+                try:
+                    view = memoryview(payload)
+                    while view:
+                        n = os.write(fd, view)
+                        view = view[n:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, target)
+                dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+                self.path = target
+                self.error = None
+                return target
+            except OSError as e:
+                self.error = '%s: %s' % (d, e)
+        return None
+
+
+def acquire_lock(path, timeout):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    t0 = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd, time.monotonic() - t0, True
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                os.close(fd)
+                raise
+        if time.monotonic() - t0 >= timeout:
+            return fd, time.monotonic() - t0, False
+        time.sleep(0.05)
+
+
+# ----------------------------------------------------------------- per card
+def discover(devdir):
+    cards, ignored = [], 0
+    for name in sorted(os.listdir(devdir)):
+        d = os.path.join(devdir, name)
+        try:
+            vendor = read_hex(os.path.join(d, 'vendor'))
+            device = read_hex(os.path.join(d, 'device'))
+        except (OSError, ValueError):
+            continue
+        if vendor != VENDOR:
+            continue
+        if device not in DEVICES:
+            ignored += 1
+            continue
+        cards.append(dict(bdf=name, path=d, vendor=vendor, device=device))
+    return cards, ignored
+
+
+PRIO = {'SKIP': 'notice', 'OK': 'notice', 'REPAIRED': 'notice', 'WOULD_REPAIR': 'notice',
+        'WOULD_REFUSE': 'warning', 'REFUSE': 'warning', 'ERROR': 'err', 'DECODE_OFF': 'warning',
+        'FAILED_AFTER_WRITE1': 'err', 'FAILED_AFTER_WRITE2': 'err'}
+
+
+def finish(card, action, reason):
+    card['action'] = action
+    card['reason'] = reason
+    card['finished_utc'] = stamp(utcnow())
+    text = {'SKIP': 'SKIP', 'OK': 'OK', 'REPAIRED': 'REPAIRED', 'REFUSE': 'REFUSE',
+            'WOULD_REPAIR': 'WOULD REPAIR', 'WOULD_REFUSE': 'WOULD REFUSE', 'ERROR': 'ERROR',
+            'DECODE_OFF': 'decode off:',
+            'FAILED_AFTER_WRITE1': 'FAILED after write 1', 'FAILED_AFTER_WRITE2': 'FAILED after write 2'}[action]
+    log(PRIO[action], '%s %s %s' % (card['bdf'], text, reason))
+
+
+def driver_of(path):
+    try:
+        return os.path.basename(os.readlink(os.path.join(path, 'driver')))
+    except OSError:
+        return None
+
+
+def process_card(card, mode, journal, run, opts):
+    bdf, path = card['bdf'], card['path']
+    card.update(action=None, reason=None, writes=[], words_before=None, words_after=None,
+                decode_enabled_by_tool=False, started_utc=stamp(utcnow()))
+    try:
+        card['class'] = read_text(os.path.join(path, 'class'))
+    except OSError:
+        card['class'] = None
+    card['driver'] = driver_of(path)
+    card['nvidia_module_state'] = nvidia_module_state(opts.modules_dir)
+    res0 = os.path.join(path, 'resource0')
+    try:
+        card['resource0_size'] = os.stat(res0).st_size
+        card['resource1_size'] = os.stat(os.path.join(path, 'resource1')).st_size
+    except OSError as e:
+        finish(card, 'REFUSE', 'cannot stat resource0/resource1: %s' % e)
+        return
+    card['host_bar1_64g'] = card['resource1_size'] == RES1_SIZE
+    if card['resource0_size'] != RES0_SIZE:
+        finish(card, 'REFUSE', 'resource0 size %d is not 16 MiB; nothing mapped' % card['resource0_size'])
+        return
+    if mode != 'check' and card['driver']:
+        finish(card, 'SKIP', 'driver %s bound; nothing mapped, zero writes' % card['driver'])
+        return
+    if mode != 'check' and card['nvidia_module_state'] and not opts.allow_module_loaded:
+        finish(card, 'SKIP', 'nvidia module loaded (initstate %s); a live run needs it absent unless '
+               '--allow-module-loaded; nothing mapped, zero writes' % card['nvidia_module_state'])
+        return
+    config_path = os.path.join(path, 'config')
+    try:
+        card['config'] = read_config(config_path)
+    except (OSError, ValueError) as e:
+        finish(card, 'REFUSE', 'config unreadable: %s' % e)
+        return
+    cmd0 = card['config']['command']
+    if not cmd0 & CMD_MEMORY:
+        # Cold boot: the kernel leaves a driverless function with decode off and
+        # BAR0 reads all-ones.  Only a live run on a 64 GiB card turns it on.
+        if not card['host_bar1_64g']:
+            finish(card, 'SKIP', 'host BAR1 small (resource1=%d bytes, not 64 GiB); memory decode off '
+                   '(config COMMAND=0x%04x), page not read, zero writes' % (card['resource1_size'], cmd0))
+            return
+        if mode != 'repair':
+            finish(card, 'DECODE_OFF', 'memory decode off (config COMMAND=0x%04x), driver %s; a live run '
+                   'enables it via sysfs enable (pci_enable_device, MEM only) and then evaluates the page; '
+                   'page not read, zero writes' % (cmd0, card['driver'] or 'unbound'))
+            return
+        card['config_before_enable'] = card['config']
+        card['enable_count_before'] = read_enable_count(path)
+        try:
+            enable_decode(path)
+        except OSError as e:
+            finish(card, 'REFUSE', 'cannot enable memory decode via sysfs enable: %s; page not read, zero writes' % e)
+            return
+        card['decode_enabled_by_tool'] = True
+        card['enable_count_after'] = read_enable_count(path)
+        try:
+            card['config'] = read_config(config_path)
+        except (OSError, ValueError) as e:
+            finish(card, 'REFUSE', 'config unreadable after sysfs enable: %s; page not read, zero writes' % e)
+            return
+        cmd1 = card['config']['command']
+        if not cmd1 & CMD_MEMORY:
+            finish(card, 'REFUSE', 'memory decode still off after sysfs enable (config COMMAND 0x%04x -> 0x%04x); '
+                   'page not read, zero writes' % (cmd0, cmd1))
+            return
+        if cmd1 & CMD_BUS_MASTER:
+            finish(card, 'REFUSE', 'BUS_MASTER on after sysfs enable (config COMMAND 0x%04x -> 0x%04x); '
+                   'page not read, zero writes' % (cmd0, cmd1))
+            return
+        journal.persist(run)
+        log('notice', '%s enabled memory decode via sysfs enable (config COMMAND 0x%04x -> 0x%04x, enable count '
+            '%s -> %s); left enabled' % (bdf, cmd0, cmd1, card['enable_count_before'], card['enable_count_after']))
+    try:
+        with MirrorPage(res0) as page:
+            words = page.snapshot()
+    except OSError as e:
+        finish(card, 'ERROR', 'resource0 page 0x88000 read-only map/read failed: %s' % e)
+        return
+    card['words_before'] = words
+    log('info', '%s words %s' % (bdf, hexw(words)))
+    profile, detail = classify(words, card['device'])
+    card['profile'] = profile
+    card['profile_detail'] = detail
+    where = 'driver %s; ' % card['driver'] if card['driver'] else 'driver unbound; '
+    if not card['host_bar1_64g']:
+        finish(card, 'SKIP', 'host BAR1 small (resource1=%d bytes, not 64 GiB); %smirror %s'
+               % (card['resource1_size'], where, fields(words)))
+        return
+    if profile == 'RESTORED':
+        finish(card, 'OK', 'already restored (%s); %shost BAR1 64 GiB; zero writes' % (fields(words), where))
+        return
+    if profile != 'RESET':
+        finish(card, 'REFUSE', 'unexpected profile (%s); %szero writes; words %s' % (detail, where, hexw(words)))
+        return
+    reasons = idle_reasons(card['config'], words) + bar1_alignment_reasons(words)
+    card['idle_reasons'] = reasons
+    cmd = 'config COMMAND=0x%04x' % card['config']['command']
+    if mode == 'check':
+        if card['driver']:
+            finish(card, 'WOULD_REPAIR', 'reset profile (%s); driver %s is bound now (%s), the live run writes '
+                   '0x724=0x30 then 0xdcc=0x8000000a at the next unbound module load'
+                   % (fields(words), card['driver'], cmd))
+        elif reasons:
+            finish(card, 'WOULD_REFUSE', 'reset profile but not repairable (%s)' % '; '.join(reasons))
+        else:
+            finish(card, 'WOULD_REPAIR', 'reset profile (%s), idle, driver unbound: a live run would write '
+                   '0x724=0x30 then 0xdcc=0x8000000a now' % fields(words))
+        return
+    if reasons:
+        finish(card, 'REFUSE', 'reset profile but not repairable (%s); zero writes' % '; '.join(reasons))
+        return
+    if mode == 'dry-run':
+        finish(card, 'WOULD_REPAIR', 'reset profile (%s), idle, driver unbound: live run would write '
+               '0x724=0x30 then 0xdcc=0x8000000a' % fields(words))
+        return
+    repair(card, res0, words, journal, run)
+
+
+def repair(card, res0, before, journal, run):
+    bdf = card['bdf']
+    card['action'] = 'REPAIR_INTENT'
+    card['intent_utc'] = stamp(utcnow())
+    if journal.persist(run) is None:
+        finish(card, 'REFUSE', 'journal unavailable (%s); no write without a durable intent record' % journal.error)
+        return
+    log('notice', '%s REPAIR intent journaled at %s; writing 0x724=0x30 then 0xdcc=0x8000000a' % (bdf, journal.path))
+    try:
+        page = MirrorPage(res0, writable=True)
+    except OSError as e:
+        finish(card, 'REFUSE', 'cannot map resource0 page for writing: %s; zero writes' % e)
+        return
+    try:
+        if driver_of(card['path']):
+            finish(card, 'REFUSE', 'driver appeared before the first write; zero writes')
+            return
+        recheck = page.snapshot()
+        if recheck != before:
+            card['words_recheck'] = recheck
+            finish(card, 'REFUSE', 'words changed between the read-only read and the write mapping; zero writes; now %s' % hexw(recheck))
+            return
+        page.write32(*WRITES[0])
+        card['writes'].append(dict(offset=WRITES[0][0], value=WRITES[0][1], utc=stamp(utcnow())))
+        journal.persist(run)
+        after1 = page.snapshot()
+        card['words_after_write1'] = after1
+        log('info', '%s after write 1 %s' % (bdf, hexw(after1)))
+        problems = check_after_write1(before, after1)
+        if problems:
+            finish(card, 'FAILED_AFTER_WRITE1', 'readback unexpected (%s); stopped before write 2; '
+                   'COLD RECOVERY (VM power cycle) required, do not retry' % '; '.join(problems))
+            return
+        page.write32(*WRITES[1])
+        card['writes'].append(dict(offset=WRITES[1][0], value=WRITES[1][1], utc=stamp(utcnow())))
+        journal.persist(run)
+        after2 = page.snapshot()
+        card['words_after'] = after2
+        log('info', '%s after write 2 %s' % (bdf, hexw(after2)))
+        problems = check_after_write2(before, after2)
+        if problems:
+            finish(card, 'FAILED_AFTER_WRITE2', 'readback unexpected (%s); COLD RECOVERY (VM power cycle) '
+                   'required, do not retry' % '; '.join(problems))
+            return
+        finish(card, 'REPAIRED', '%s after 2 writes; all other words unchanged' % fields(after2))
+    finally:
+        page.close()
+
+
+# ----------------------------------------------------------------- main
+def summarize(cards):
+    s = {}
+    for c in cards:
+        a = (c.get('action') or 'NONE').lower()
+        s[a] = s.get(a, 0) + 1
+    return s
+
+
+def main(argv=None):
+    global _SYSLOG
+    ap = argparse.ArgumentParser(prog=TOOL, description='Restore the CMP 170HX 64 GiB BAR1 vendor override '
+                                 'before the nvidia module loads (see the module docstring).')
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument('--check', action='store_true', help='read-only report, allowed with the driver bound; '
+                   'prints each card state and what a live run would do')
+    g.add_argument('--dry-run', action='store_true', help='read-only; applies the live-run gates (driver '
+                   'unbound, idle) and reports what it would do; zero writes')
+    ap.add_argument('--strict', action='store_true', help='with --check/--dry-run: exit 1 unless every CMP is OK or SKIP')
+    ap.add_argument('--json', action='store_true', help='also print the run record as JSON on stdout')
+    ap.add_argument('--no-syslog', action='store_true', help='do not send log lines to the system journal')
+    ap.add_argument('--sysfs-devices', default=SYSFS_DEVICES, metavar='DIR', help='default %(default)s')
+    ap.add_argument('--journal-dir', default=JOURNAL_DIR, metavar='DIR', help='default %(default)s')
+    ap.add_argument('--run-dir', default=RUN_DIR, metavar='DIR', help='fallback journal dir, default %(default)s')
+    ap.add_argument('--lock-file', default=LOCK_FILE, metavar='FILE', help='default %(default)s')
+    ap.add_argument('--lock-timeout', type=float, default=LOCK_TIMEOUT, metavar='SEC',
+                    help='wait for the lock this long, then REFUSE the whole run; default %(default)s')
+    ap.add_argument('--modules-dir', default=SYSFS_MODULES, metavar='DIR', help='default %(default)s')
+    ap.add_argument('--allow-module-loaded', action='store_true',
+                    help='live run: allow writes while the nvidia module is loaded (card must still be unbound)')
+    args = ap.parse_args(argv)
+    _SYSLOG = not args.no_syslog
+    mode = 'check' if args.check else ('dry-run' if args.dry_run else 'repair')
+    os.umask(0o077)
+    started = utcnow()
+    try:
+        boot_id = read_text(BOOT_ID_FILE)
+    except OSError:
+        boot_id = 'unknown-boot'
+    run = dict(schema=1, tool=TOOL, version=VERSION, mode=mode, boot_id=boot_id,
+               hostname=socket.gethostname(), started_utc=stamp(started), finished_utc=None,
+               argv=list(sys.argv), pid=os.getpid(), euid=os.geteuid(), invoked_by=ancestry(),
+               lock=None, cards=[], ignored_nvidia_devices=0, summary={}, exit_code=0, errors=[])
+    journal = Journal(args.journal_dir, os.path.join(args.run_dir, 'journal'), boot_id, started)
+    cards = []
+    lock_fd = None
+    rc = 0
+    log('info', '%s %s %s boot=%s host=%s euid=%d pid=%d' % (TOOL, VERSION, mode, boot_id, run['hostname'], run['euid'], run['pid']))
+    try:
+        lock_path = args.lock_file
+        proceed = True
+        try:
+            lock_fd, waited, got = acquire_lock(lock_path, args.lock_timeout)
+            run['lock'] = dict(path=lock_path, waited_s=round(waited, 3), acquired=got)
+            if not got:
+                log('err', 'REFUSE lock %s still busy after %.0f s: another run is in progress; no card accessed'
+                    % (lock_path, waited))
+                run['errors'].append('lock timeout')
+                proceed = False
+            elif waited >= 0.05:
+                log('notice', 'lock %s acquired after %.2f s wait' % (lock_path, waited))
+        except OSError as e:
+            run['lock'] = dict(path=lock_path, error=str(e))
+            log('err', 'REFUSE cannot take lock %s (%s); no card accessed' % (lock_path, e))
+            run['errors'].append('lock error: %s' % e)
+            proceed = False
+        if proceed:
+            cards, run['ignored_nvidia_devices'] = discover(args.sysfs_devices)
+            if not cards:
+                log('warning', 'no CMP 170HX (10de:20c2/2082) found under %s' % args.sysfs_devices)
+            for card in cards:
+                run['cards'].append(card)
+                try:
+                    process_card(card, mode, journal, run, args)
+                except Exception as e:
+                    run['errors'].append(traceback.format_exc())
+                    finish(card, 'ERROR', 'unexpected exception: %r' % e)
+    except Exception as e:
+        run['errors'].append(traceback.format_exc())
+        log('err', '%s unexpected error: %r' % (TOOL, e))
+    finally:
+        run['summary'] = summarize(cards)
+        run['finished_utc'] = stamp(utcnow())
+        if mode != 'repair' and args.strict:
+            rc = 0 if cards and all(c.get('action') in ('OK', 'SKIP') for c in cards) and not run['errors'] else 1
+        elif args.strict:
+            log('warning', '--strict is only honoured with --check/--dry-run; live runs always exit 0')
+        run['exit_code'] = rc
+        path = journal.persist(run)
+        log('notice', '%s %s summary %s; journal %s' % (TOOL, mode, json.dumps(run['summary'], sort_keys=True),
+                                                        path or ('UNWRITTEN (%s)' % journal.error)))
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        if args.json:
+            try:
+                sys.stdout.write(json.dumps(run, indent=1, sort_keys=True) + '\n')
+                sys.stdout.flush()
+            except Exception:
+                pass
+    return rc
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        # Last resort: the driver load must not depend on this tool.
+        try:
+            log('err', '%s crashed: %s' % (TOOL, traceback.format_exc().strip().splitlines()[-1]))
+        except Exception:
+            pass
+        sys.exit(0)

@@ -1,0 +1,368 @@
+From e404fc1810ee6a301991487d4028bf9c833a2bb9 Mon Sep 17 00:00:00 2001
+From: darkmaniac7 <darkmaniac7@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 06:51:33 -0500
+Subject: [PATCH 4/4] Port cmpunlocker PR #55 SM reconfiguration override
+ behind NVreg_CmpSmReconfig
+
+CMP 170HX only (0x20C2 / 0x2082). New DWORD registry key CmpSmReconfig
+(default 0, per device through NVreg_RegistryDwordsPerDevice). With 1, inside
+the SEC2/Booter unlock window, after the PCIe retrain and before the ECC
+recipe:
+
+ 1. RECONFIG_PLM 0x008200d8 <- 0xffffffff through the post-Booter payload,
+    one Booter Load per attempt, up to two attempts, WPR2 blanked before each
+    payload (as the ECC recipe does) and restored to the saved window after.
+ 2. Read OPT_GPC_DISABLE 0x00820350 and TPC STATUS 0x00820c38 + 4*gpc.
+ 3. gpc 0..7: BAR0 write 0x000000ff to the TPC RECONFIG OVERRIDE
+    0x00820a40 + 4*gpc (a host write once the PLM is open, as upstream),
+    read back the override and STATUS, log
+    "CMP580: sm reconfig GPCn OVR(..)<-0xff read=.. taken|MISMATCH STATUS a->b".
+    All writes are skipped if the PLM did not open; a GPC is skipped if its
+    STATUS pre-read is invalid (0xffffffff / 0xbadxxxxx).
+ 4. "CMP580: sm reconfig done" line: PLM state, taken/mismatched/invalid,
+    OPT_GPC_DISABLE, per-GPC STATUS before->after (fresh re-read), number of
+    GPCs whose STATUS changed, and the implied TPC and SM count. Then the
+    SS0/SS1/CFG1/LMR memory postcondition is re-checked, fatal if broken,
+    exactly as after the retrain and the ECC recipe. Nothing else is fatal.
+
+Rationale (PR #55): STATUS = DISABLE | DEFECTIVE | CTRL | (RECONFIG & ~OVERRIDE),
+so the override can only release TPCs reserved through RECONFIG, never
+defective or GPC-swept ones. Upstream measured on 0x20C2: OPT_GPC_DISABLE=0x85,
+GPC4/GPC5 STATUS 0x01->0x00, +2 TPC = +4 SM, torch multi_processor_count
+70->74. All four test cards logged two GPCs 0x01->0x00 under the 615
+cmpunlocker build on 2026-10-17 (OPT_GPC_DISABLE 0x85, 0x0b, 0xa8, 0x23).
+
+Placement: before the ECC recipe call rather than after it, so that no
+Booter round runs after the ECC recipe's WPR/VPR/lock teardown; upstream's
+order is the same (SM override, PCIe, ECC). With CmpEccRecipe=0 the two
+placements are the same.
+
+Difference from upstream: upstream opens RECONFIG_PLM in its always-on PLM
+table next to OPT_PLM 0x8200fc, FEAT2 0x823b00 and PJTAG 0xc840/0xc848. This
+tree's minimal table has none of those, so only RECONFIG_PLM is opened, and
+only when requested. With the key absent or 0 nothing is written or logged.
+
+Attribution and provenance: the register addresses, values, sequence and the
+STATUS rationale come from cmpunlocker PR #55 "Add +4 more SMs" by Amogh
+Munikote, landed as commit 6c442ee "Add more SMs" (2026-09-24) in
+github.com/amoghmunikote/cmpunlocker. That project is GPL-2.0 and ships its
+work as patches to NVIDIA's open-gpu-kernel-modules, where kernel_gsp.c is
+MIT and the module is "Dual MIT/GPL". The code here is written fresh in this
+tree's CMP580 style and is distributed under GPL-2.0 as a derived work.
+---
+ kernel-open/nvidia/nv-reg.h                   |  18 ++
+ src/nvidia/arch/nvalloc/unix/include/nv-reg.h |  18 ++
+ src/nvidia/interface/nvrm_registry.h          |  17 ++
+ src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c    | 178 ++++++++++++++++++
+ 4 files changed, 231 insertions(+)
+
+diff --git a/kernel-open/nvidia/nv-reg.h b/kernel-open/nvidia/nv-reg.h
+index a7a1da6..1245790 100644
+--- a/kernel-open/nvidia/nv-reg.h
++++ b/kernel-open/nvidia/nv-reg.h
+@@ -802,6 +802,22 @@
+ #define NV_REG_CMP_ECC_RECIPE NV_REG_STRING(__NV_CMP_ECC_RECIPE)
+ #define NV_REG_CMP_ECC_RECIPE_DEFAULT 0
+ 
++/*
++ * Option: CmpSmReconfig
++ *
++ * Description:
++ *
++ * CMP 170HX only. 1 opens RECONFIG_PLM through the SEC2 post-Booter payload
++ * during the unlock window and writes the eight per-GPC TPC reconfiguration
++ * overrides (cmpunlocker PR #55), logging every write and read-back; only
++ * TPCs reserved through RECONFIG can come back. 0 does nothing.
++ *
++ * Default: 0.
++ */
++#define __NV_CMP_SM_RECONFIG CmpSmReconfig
++#define NV_REG_CMP_SM_RECONFIG NV_REG_STRING(__NV_CMP_SM_RECONFIG)
++#define NV_REG_CMP_SM_RECONFIG_DEFAULT 0
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -1037,6 +1053,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_ECC_RECIPE, NV_REG_CMP_ECC_RECIPE_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_SM_RECONFIG, NV_REG_CMP_SM_RECONFIG_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1088,6 +1105,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_ECC_RECIPE),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_SM_RECONFIG),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+index a7a1da6..1245790 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
++++ b/src/nvidia/arch/nvalloc/unix/include/nv-reg.h
+@@ -802,6 +802,22 @@
+ #define NV_REG_CMP_ECC_RECIPE NV_REG_STRING(__NV_CMP_ECC_RECIPE)
+ #define NV_REG_CMP_ECC_RECIPE_DEFAULT 0
+ 
++/*
++ * Option: CmpSmReconfig
++ *
++ * Description:
++ *
++ * CMP 170HX only. 1 opens RECONFIG_PLM through the SEC2 post-Booter payload
++ * during the unlock window and writes the eight per-GPC TPC reconfiguration
++ * overrides (cmpunlocker PR #55), logging every write and read-back; only
++ * TPCs reserved through RECONFIG can come back. 0 does nothing.
++ *
++ * Default: 0.
++ */
++#define __NV_CMP_SM_RECONFIG CmpSmReconfig
++#define NV_REG_CMP_SM_RECONFIG NV_REG_STRING(__NV_CMP_SM_RECONFIG)
++#define NV_REG_CMP_SM_RECONFIG_DEFAULT 0
++
+ /*
+  * Option: EnableDbgBreakpoint
+  *
+@@ -1037,6 +1053,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                            NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_PCIE_TARGET_GEN, NV_REG_CMP_PCIE_TARGET_GEN_DEFAULT);
+ NV_DEFINE_REG_ENTRY(__NV_CMP_ECC_RECIPE, NV_REG_CMP_ECC_RECIPE_DEFAULT);
++NV_DEFINE_REG_ENTRY(__NV_CMP_SM_RECONFIG, NV_REG_CMP_SM_RECONFIG_DEFAULT);
+ 
+ /*
+  *----------------registry database definition----------------------
+@@ -1088,6 +1105,7 @@ nv_parm_t nv_parms[] = {
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_PCIE_TARGET_GEN),
+     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_ECC_RECIPE),
++    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CMP_SM_RECONFIG),
+     {NULL, NULL}
+ };
+ 
+diff --git a/src/nvidia/interface/nvrm_registry.h b/src/nvidia/interface/nvrm_registry.h
+index 07809a8..76e9081 100644
+--- a/src/nvidia/interface/nvrm_registry.h
++++ b/src/nvidia/interface/nvrm_registry.h
+@@ -2669,6 +2669,23 @@
+ #define NV_REG_STR_CMP_ECC_RECIPE_DISABLED                0
+ #define NV_REG_STR_CMP_ECC_RECIPE_APPLY                   1
+ 
++//
++// Type DWORD
++// CMP 170HX only (PCI device 0x20C2 / 0x2082): opt-in SM
++// reconfiguration override, a port of cmpunlocker PR #55 ("Add +4 more SMs").
++// 0 (default) does nothing. 1 opens RECONFIG_PLM (0x8200d8) through the SEC2
++// post-Booter payload while the unlock window is open, then writes 0xff to
++// the eight per-GPC TPC reconfiguration overrides (0x820a40 + 4*gpc) and logs
++// every write, read-back and per-GPC TPC status (0x820c38 + 4*gpc) as
++// "CMP580: sm reconfig". Only TPCs held back by RECONFIG can come back;
++// defective and floor-swept TPCs stay off. Exposed as NVreg_CmpSmReconfig,
++// usable per device through NVreg_RegistryDwordsPerDevice.
++//
++#define NV_REG_STR_CMP_SM_RECONFIG                        "CmpSmReconfig"
++#define NV_REG_STR_CMP_SM_RECONFIG_DEFAULT                0
++#define NV_REG_STR_CMP_SM_RECONFIG_DISABLED               0
++#define NV_REG_STR_CMP_SM_RECONFIG_APPLY                  1
++
+ //
+ // Type DWORD
+ // Regkey to set the number of retry attempts at GSP bootstrap
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+index c40072f..3e68eff 100644
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -4473,6 +4473,171 @@ _kgspCmp580EccRecipe(OBJGPU *pGpu, KernelGsp *pKernelGsp, NvU32 wpr2Lo, NvU32 wp
+     return NV_OK;
+ }
+ 
++/*
++ * CMP580: opt-in SM reconfiguration override, a port of cmpunlocker
++ * PR #55 "Add +4 more SMs" (upstream commit 6c442ee). The CMP 170HX fuses
++ * hold some functional TPCs back through the TPC RECONFIG mask. The per-GPC
++ * TPC status that floorsweeping consumes is
++ *     STATUS = DISABLE | DEFECTIVE | CTRL | (RECONFIG & ~OVERRIDE)
++ * so writing 0xff to a GPC's RECONFIG OVERRIDE releases only the TPCs that
++ * RECONFIG reserved; defective and GPC-swept TPCs stay off. Upstream measured
++ * 70 -> 74 SMs on 0x20C2 (OPT_GPC_DISABLE=0x85, GPC4/GPC5 STATUS 0x01->0x00).
++ *
++ * RECONFIG_PLM is opened through the Booter (one Booter Load per attempt, two
++ * attempts, WPR2 blanked before every payload, as the ECC recipe does); the
++ * overrides are then plain BAR0 writes, as upstream does them. Every write is
++ * logged with its read-back. Failures are logged and skipped: this never
++ * fails the boot (the caller re-checks the memory postcondition).
++ */
++#define CMP580_SM_RECONFIG_PLM          0x008200d8U
++#define CMP580_SM_OPT_GPC_DISABLE       0x00820350U
++#define CMP580_SM_TPC_RECONFIG_OVR(g)   (0x00820a40U + (g) * 4U)
++#define CMP580_SM_TPC_STATUS(g)         (0x00820c38U + (g) * 4U)
++#define CMP580_SM_GPC_COUNT             8U
++#define CMP580_SM_TPC_MASK              0x000000ffU
++#define CMP580_SM_PER_TPC               2U
++#define CMP580_SM_READ_INVALID(v) \
++    ((v) == 0xffffffffU || ((v) & 0xfff00000U) == 0xbad00000U)
++
++static NvU32
++_kgspCmp580SmReconfigRequested(OBJGPU *pGpu)
++{
++    NvU32 mode = NV_REG_STR_CMP_SM_RECONFIG_DEFAULT;
++
++    if (osReadRegistryDword(pGpu, NV_REG_STR_CMP_SM_RECONFIG, &mode) != NV_OK)
++        mode = NV_REG_STR_CMP_SM_RECONFIG_DEFAULT;
++    if (mode > NV_REG_STR_CMP_SM_RECONFIG_APPLY)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: sm reconfig disabled: NVreg_CmpSmReconfig=%u is outside 0..1\n", mode);
++        mode = NV_REG_STR_CMP_SM_RECONFIG_DISABLED;
++    }
++    return mode;
++}
++
++/* Enabled TPCs implied by the per-GPC status masks (a set bit is a TPC that is off). */
++static NvU32
++_kgspCmp580SmTpcsEnabled(const NvU32 *pStatus)
++{
++    NvU32 gpc, tpcs = 0;
++
++    for (gpc = 0; gpc < CMP580_SM_GPC_COUNT; gpc++)
++        if (!CMP580_SM_READ_INVALID(pStatus[gpc]))
++            tpcs += nvPopCount32(~pStatus[gpc] & CMP580_SM_TPC_MASK);
++    return tpcs;
++}
++
++static NV_STATUS
++_kgspCmp580SmReconfig(OBJGPU *pGpu, KernelGsp *pKernelGsp, NvU32 wpr2Lo, NvU32 wpr2Hi)
++{
++    NvU32 mode = _kgspCmp580SmReconfigRequested(pGpu);
++    NvU32 statusBefore[CMP580_SM_GPC_COUNT];
++    NvU32 statusAfter[CMP580_SM_GPC_COUNT];
++    NvU32 gpc, attempt, plmBefore, plmRead = 0, gpcDisable, tpcsBefore, tpcsAfter;
++    NvU32 taken = 0, mismatched = 0, invalid = 0, changed = 0;
++    NvBool bPlmOpen = NV_FALSE;
++
++    if (mode != NV_REG_STR_CMP_SM_RECONFIG_APPLY)
++    {
++        NV_PRINTF(LEVEL_ERROR, "CMP580: sm reconfig not requested (NVreg_CmpSmReconfig=%u)\n", mode);
++        return NV_OK;
++    }
++
++    plmBefore  = GPU_REG_RD32(pGpu, CMP580_SM_RECONFIG_PLM);
++    gpcDisable = GPU_REG_RD32(pGpu, CMP580_SM_OPT_GPC_DISABLE);
++    for (gpc = 0; gpc < CMP580_SM_GPC_COUNT; gpc++)
++        statusBefore[gpc] = GPU_REG_RD32(pGpu, CMP580_SM_TPC_STATUS(gpc));
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: sm reconfig requested (NVreg_CmpSmReconfig=1); saved WPR2 lo=0x%08x hi=0x%08x "
++              "RECONFIG_PLM=0x%08x OPT_GPC_DISABLE=0x%08x\n",
++              wpr2Lo, wpr2Hi, plmBefore, gpcDisable);
++
++    for (attempt = 0; attempt < 2 && !bPlmOpen; attempt++)
++    {
++        NV_STATUS st;
++
++        /* As the ECC recipe: blank the WPR2 window before every payload. */
++        GPU_REG_WR32(pGpu, 0x001fa824U, 0xffffffffU);
++        GPU_REG_WR32(pGpu, 0x001fa828U, 0x00000000U);
++
++        st = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp, CMP580_SM_RECONFIG_PLM, 0xffffffffU);
++        if (st != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR, "CMP580: sm reconfig RECONFIG_PLM payload refill failed: 0x%x\n", st);
++            continue;
++        }
++        st = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
++            memdescGetPhysAddr(SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp), AT_GPU, 0));
++        plmRead = GPU_REG_RD32(pGpu, CMP580_SM_RECONFIG_PLM);
++        bPlmOpen = (plmRead == 0xffffffffU);
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: sm reconfig RECONFIG_PLM(0x%x) before=0x%08x want=0xffffffff attempt=%u "
++                  "status=0x%x read=0x%08x%s\n",
++                  CMP580_SM_RECONFIG_PLM, plmBefore, attempt, st, plmRead,
++                  bPlmOpen ? " taken" : " MISMATCH");
++    }
++
++    /* Leave the WPR2 window the way the PCIe retrain left it. */
++    GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++    GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++
++    if (!bPlmOpen)
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: sm reconfig RECONFIG_PLM did not open after 2 attempts; override writes skipped\n");
++
++    for (gpc = 0; bPlmOpen && gpc < CMP580_SM_GPC_COUNT; gpc++)
++    {
++        NvU32 ovr, statusNow;
++
++        if (CMP580_SM_READ_INVALID(statusBefore[gpc]))
++        {
++            invalid++;
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMP580: sm reconfig GPC%u STATUS(0x%x) pre-read invalid 0x%08x; write skipped\n",
++                      gpc, CMP580_SM_TPC_STATUS(gpc), statusBefore[gpc]);
++            continue;
++        }
++
++        GPU_REG_WR32(pGpu, CMP580_SM_TPC_RECONFIG_OVR(gpc), CMP580_SM_TPC_MASK);
++        ovr = GPU_REG_RD32(pGpu, CMP580_SM_TPC_RECONFIG_OVR(gpc));
++        statusNow = GPU_REG_RD32(pGpu, CMP580_SM_TPC_STATUS(gpc));
++        if ((ovr & CMP580_SM_TPC_MASK) == CMP580_SM_TPC_MASK)
++            taken++;
++        else
++            mismatched++;
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP580: sm reconfig GPC%u OVR(0x%x)<-0xff read=0x%08x%s STATUS(0x%x) 0x%08x->0x%08x%s\n",
++                  gpc, CMP580_SM_TPC_RECONFIG_OVR(gpc), ovr,
++                  ((ovr & CMP580_SM_TPC_MASK) == CMP580_SM_TPC_MASK) ? " taken" : " MISMATCH",
++                  CMP580_SM_TPC_STATUS(gpc), statusBefore[gpc], statusNow,
++                  (statusNow != statusBefore[gpc]) ? " changed" : "");
++    }
++
++    /* Fresh read of every GPC once all overrides are in. */
++    for (gpc = 0; gpc < CMP580_SM_GPC_COUNT; gpc++)
++    {
++        statusAfter[gpc] = GPU_REG_RD32(pGpu, CMP580_SM_TPC_STATUS(gpc));
++        if (statusAfter[gpc] != statusBefore[gpc])
++            changed++;
++    }
++    tpcsBefore = _kgspCmp580SmTpcsEnabled(statusBefore);
++    tpcsAfter  = _kgspCmp580SmTpcsEnabled(statusAfter);
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP580: sm reconfig done: plm=%s taken=%u mismatched=%u invalid=%u of %u; "
++              "OPT_GPC_DISABLE=0x%08x changed=%u TPC %u->%u (est SM %u->%u) STATUS "
++              "0:%x->%x 1:%x->%x 2:%x->%x 3:%x->%x 4:%x->%x 5:%x->%x 6:%x->%x 7:%x->%x\n",
++              bPlmOpen ? "open" : "closed", taken, mismatched, invalid, CMP580_SM_GPC_COUNT,
++              gpcDisable, changed, tpcsBefore, tpcsAfter,
++              tpcsBefore * CMP580_SM_PER_TPC, tpcsAfter * CMP580_SM_PER_TPC,
++              statusBefore[0], statusAfter[0], statusBefore[1], statusAfter[1],
++              statusBefore[2], statusAfter[2], statusBefore[3], statusAfter[3],
++              statusBefore[4], statusAfter[4], statusBefore[5], statusAfter[5],
++              statusBefore[6], statusAfter[6], statusBefore[7], statusAfter[7]);
++    return NV_OK;
++}
++
+ static NV_STATUS
+ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MASK *pGpusLockedMask, NvU8 *pbRetry)
+ {
+@@ -4614,6 +4779,19 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+             _kgspCmp580PcieRetrain(pGpu, pKernelGsp, wpr2Lo, wpr2Hi));
+ 
++        /*
++         * CMP580: optional SM reconfiguration override (NVreg_CmpSmReconfig).
++         * Runs before the ECC recipe so that no Booter round follows the ECC
++         * recipe's WPR/VPR/lock teardown (upstream order: SM, PCIe, ECC).
++         */
++        if (_kgspCmp580SmReconfigRequested(pGpu) == NV_REG_STR_CMP_SM_RECONFIG_APPLY)
++        {
++            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
++                _kgspCmp580SmReconfig(pGpu, pKernelGsp, wpr2Lo, wpr2Hi));
++            /* Memory postcondition must still hold after the extra Booter round (fatal otherwise). */
++            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspSec2PostblTimingCheckRegisters(pGpu));
++        }
++
+         /* CMP580: optional ECC hardware recipe experiment (NVreg_CmpEccRecipe). */
+         if (_kgspCmp580EccRecipeRequested(pGpu) == NV_REG_STR_CMP_ECC_RECIPE_APPLY)
+         {
